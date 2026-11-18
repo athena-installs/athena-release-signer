@@ -1,0 +1,15 @@
+name: gate-probe
+run-name: "gate probe ${{ inputs.note }} (proves the approval step waits; cancelled, never approved)"
+on:
+  workflow_dispatch:
+    inputs:
+      note:
+        description: "why this probe ran"
+        required: true
+permissions: {}
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    environment: release-signing
+    steps:
+      - run: echo "approved; this probe holds no key and does nothing"
