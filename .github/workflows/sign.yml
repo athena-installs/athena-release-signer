@@ -1,0 +1,128 @@
+name: sign
+# SIGNS ONE ATHENA RELEASE MANIFEST, only after Atiba approves it.
+#
+# This repository is public and holds nothing but this file. The signing key is the secret RELEASE_SIGNING_KEY of
+# the environment `release-signing` (required reviewer: Atiba; branch main only; admins cannot bypass), so no job
+# can read it until he approves this run. The run's title shows what he is approving: the kind, the version, the
+# commit and a link to the run that built it, whose log printed the manifest and its sha256.
+#
+# Started from the laptop by scripts/install-release.mjs (atibadesouza/athena-realtime) for an app release, or by
+# the skills catalogue publish for the operator plugin's skills manifest. It signs, with Ed25519 (Node's built-in
+# crypto), exactly these bytes (UTF-8, "\n" between lines, no trailing newline):
+#   release: athena-release-v1\n<version>\n<manifest sha256>
+#   skills:  athena-skills-v1\n<plugin version>\n<skills manifest sha256>
+# and uploads {"key_id", "sig", "kind"} as the artifact `signature` (file manifest.sig.json). It prints only that
+# file and the key id. Every input is checked against a strict pattern before use and reaches the script only
+# through env:, never written into a shell line.
+on:
+  workflow_dispatch:
+    inputs:
+      kind:
+        description: "release or skills"
+        required: true
+        type: choice
+        options: [release, skills]
+      version:
+        description: "YYYY.MM.DD or YYYY.MM.DD.N"
+        required: true
+        type: string
+      manifest_sha256:
+        description: "sha256 of the manifest, 64 lowercase hex"
+        required: true
+        type: string
+      commit:
+        description: "the app commit, 40 hex (release); - for skills"
+        required: true
+        type: string
+      run_url:
+        description: "link to the run that built it (release: a run in atibadesouza/athena-realtime); - for skills built on the laptop"
+        required: true
+        type: string
+
+run-name: sign ${{ inputs.kind }} ${{ inputs.version }} ${{ inputs.commit }} ${{ inputs.run_url }}
+
+permissions: {}
+
+concurrency:
+  group: sign-${{ github.run_id }}
+
+jobs:
+  # Bad inputs fail here, before Atiba is asked to approve anything.
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    env:
+      IN_KIND: ${{ inputs.kind }}
+      IN_VERSION: ${{ inputs.version }}
+      IN_SHA: ${{ inputs.manifest_sha256 }}
+      IN_COMMIT: ${{ inputs.commit }}
+      IN_RUN_URL: ${{ inputs.run_url }}
+    steps:
+      - name: Refuse anything but main
+        run: |
+          if [ "$GITHUB_REF" != "refs/heads/main" ]; then echo "::error::Signing runs only from main, not $GITHUB_REF."; exit 1; fi
+      - name: Check every input
+        run: |
+          node -e '
+            const e = process.env, bad = [];
+            const VERSION = /^\d{4}\.(0[1-9]|1[0-2])\.(0[1-9]|[12]\d|3[01])(\.([2-9]|[1-9]\d+))?$/;
+            if (!/^(release|skills)$/.test(e.IN_KIND)) bad.push("kind must be release or skills");
+            if (!VERSION.test(e.IN_VERSION)) bad.push("version must be YYYY.MM.DD or YYYY.MM.DD.N (N from 2)");
+            if (!/^[0-9a-f]{64}$/.test(e.IN_SHA)) bad.push("manifest_sha256 must be 64 lowercase hex characters");
+            if (e.IN_KIND === "release") {
+              if (!/^[0-9a-f]{40}$/.test(e.IN_COMMIT)) bad.push("commit must be 40 lowercase hex characters for a release");
+              if (!/^https:\/\/github\.com\/atibadesouza\/athena-realtime\/actions\/runs\/\d+(\/attempts\/\d+)?$/.test(e.IN_RUN_URL)) bad.push("run_url must be a run in atibadesouza/athena-realtime");
+            } else {
+              if (e.IN_COMMIT !== "-") bad.push("commit must be - for skills");
+              if (e.IN_RUN_URL !== "-" && !/^https:\/\/github\.com\/[A-Za-z0-9-]+\/[A-Za-z0-9._-]+\/actions\/runs\/\d+(\/attempts\/\d+)?$/.test(e.IN_RUN_URL)) bad.push("run_url must be - or a GitHub Actions run link");
+            }
+            if (bad.length) { for (const b of bad) console.error("::error::" + b); process.exit(1); }
+            console.log("Inputs are well formed.");
+          '
+
+  sign:
+    needs: check
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    environment: release-signing
+    env:
+      IN_KIND: ${{ inputs.kind }}
+      IN_VERSION: ${{ inputs.version }}
+      IN_SHA: ${{ inputs.manifest_sha256 }}
+      IN_COMMIT: ${{ inputs.commit }}
+      IN_RUN_URL: ${{ inputs.run_url }}
+    steps:
+      - name: Sign
+        env:
+          RELEASE_SIGNING_KEY: ${{ secrets.RELEASE_SIGNING_KEY }}
+        run: |
+          node -e '
+            const { createHash, createPrivateKey, createPublicKey, sign, verify } = require("node:crypto");
+            const { writeFileSync } = require("node:fs");
+            const e = process.env;
+            const VERSION = /^\d{4}\.(0[1-9]|1[0-2])\.(0[1-9]|[12]\d|3[01])(\.([2-9]|[1-9]\d+))?$/;
+            if (!/^(release|skills)$/.test(e.IN_KIND) || !VERSION.test(e.IN_VERSION) || !/^[0-9a-f]{64}$/.test(e.IN_SHA)) {
+              console.error("::error::inputs changed between the check and the signing; refusing"); process.exit(1);
+            }
+            if (!e.RELEASE_SIGNING_KEY) { console.error("::error::RELEASE_SIGNING_KEY is not set in the release-signing environment"); process.exit(1); }
+            const priv = createPrivateKey({ key: Buffer.from(e.RELEASE_SIGNING_KEY, "base64"), format: "der", type: "pkcs8" });
+            if (priv.asymmetricKeyType !== "ed25519") { console.error("::error::the signing key is not Ed25519"); process.exit(1); }
+            const pub = createPublicKey(priv);
+            const raw = Buffer.from(pub.export({ format: "jwk" }).x, "base64url");
+            const keyId = createHash("sha256").update(raw).digest("hex").slice(0, 16);
+            const head = e.IN_KIND === "release" ? "athena-release-v1" : "athena-skills-v1";
+            const bytes = Buffer.from(head + "\n" + e.IN_VERSION + "\n" + e.IN_SHA, "utf8");
+            const sig = sign(null, bytes, priv);
+            if (!verify(null, bytes, pub, sig)) { console.error("::error::the signature did not verify with its own key"); process.exit(1); }
+            const out = JSON.stringify({ key_id: keyId, sig: sig.toString("base64"), kind: e.IN_KIND });
+            writeFileSync("manifest.sig.json", out);
+            console.log("key id: " + keyId);
+            console.log(out);
+          '
+      - name: Keep the signature
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: signature
+          path: manifest.sig.json
+          retention-days: 7
+          if-no-files-found: error
